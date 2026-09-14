@@ -11,6 +11,61 @@ from ._omni_stubs import load_main
 omni = load_main()
 
 
+@pytest.mark.asyncio
+async def test_restored_feedback_is_task_generation_and_score_bound_without_capability():
+    redis = FakeRedis()
+    current = {**task(), "score": 9, "interaction_count": 27}
+    result = {"task_id": 9, "scoring_generation": 2, "score": 9, "interaction_count": 27,
+              "completion_blocker": "quality", "reason": "Add the size.",
+              "practice_tip": "A small latte, please.", "ready_token": "must-not-restore"}
+    redis.data[omni._scoring_window_key("u1", 4, 9, 2)] = json.dumps({"completed_results": [{"result": result}]})
+    restored = await omni._restore_progress_feedback(redis, "u1", 4, current)
+    assert restored["practice_tip"] == result["practice_tip"]
+    assert "ready_token" not in restored
+    assert await omni._restore_progress_feedback(redis, "u2", 4, current) is None
+    assert await omni._restore_progress_feedback(redis, "u1", 4, {**current, "scoring_generation": 3}) is None
+    assert await omni._restore_progress_feedback(redis, "u1", 4, {**current, "score": 0}) is None
+
+
+@pytest.mark.asyncio
+async def test_feedback_is_forwarded_and_qualified_window_clears_blocker():
+    callback = callback_for()
+    current = task()
+    for quality, ready in [("needs_work", False), ("satisfactory", True)]:
+        result = {
+            "score": 9, "interaction_count": 30 if ready else 27,
+            "scoring_generation": 2, "task_ready_to_complete": ready,
+            "ready_token": "token-for-confirmation" if ready else None,
+            "completion_blocker": None if ready else "quality",
+            "practice_tip": "Specify a size: A small latte, please.",
+            "reason": "Add the drink size.", "quality": quality,
+        }
+        emitted = await omni._emit_scoring_result(callback, current, 9, [], result, "token")
+        payload = callback._safe_send.await_args.args[0]["payload"]
+        assert payload["practice_tip"] == result["practice_tip"]
+        assert payload["completion_blocker"] == result["completion_blocker"]
+        assert emitted["task_ready_to_complete"] == ready
+        assert emitted["scoring_generation"] == 2
+
+
+@pytest.mark.asyncio
+async def test_readiness_pending_keeps_window_retryable_without_positive_progress():
+    redis, callback, current = FakeRedis(), callback_for(), task()
+    result = {"evaluation_status": "readiness_pending", "completion_blocker": "readiness_unavailable",
+              "score": 9, "interaction_count": 27}
+    with patch.object(omni, "_get_redis_client", return_value=redis), patch.object(
+        omni, "_post_scoring_window", AsyncMock(return_value=result)
+    ):
+        for turn_id in ("t1", "t2", "t3"):
+            await add_turn(callback, turn_id, current)
+    state = json.loads(redis.data[omni._scoring_window_key("u1", 4, 9, 2)])
+    assert state["frozen"] is True
+    assert len(state["turns"]) == 3
+    callback._safe_send.assert_awaited_once()
+    assert callback._safe_send.await_args.args[0]["type"] == "scoring_feedback"
+    assert callback._safe_send.await_args.args[0]["payload"]["completion_blocker"] == "readiness_unavailable"
+
+
 class FakeRedis:
     def __init__(self):
         self.data = {}
@@ -192,7 +247,11 @@ async def test_failed_window_freezes_and_queues_new_turn_without_progress():
     assert [turn["turn_id"] for turn in state["turns"]] == ["t1", "t2", "t3"]
     assert [turn["turn_id"] for turn in state["queue"]] == ["t4"]
     assert state["frozen"] is True
-    assert callback._safe_send.await_count == 0
+    assert callback._safe_send.await_count > 0
+    for call in callback._safe_send.await_args_list:
+        assert call.args[0]["type"] == "scoring_feedback"
+        assert call.args[0]["payload"]["completion_blocker"] == "evaluation_unavailable"
+        assert "delta" not in call.args[0]["payload"]
     assert redis.ttls[key] == 72 * 3600
 
 

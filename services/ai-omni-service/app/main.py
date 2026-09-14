@@ -706,6 +706,29 @@ async def _wait_for_scoring_result(redis, key, turn_id, evaluation_id):
     return None
 
 
+async def _restore_progress_feedback(redis, user_id, goal_id, current_task):
+    """Restore advisory feedback only; never restore a completion capability."""
+    if redis is None or not goal_id or not current_task.get("id"):
+        return None
+    generation = int(current_task.get("scoring_generation") or 0)
+    try:
+        key = _scoring_window_key(user_id, goal_id, current_task["id"], generation)
+        state = await _load_scoring_window(redis, key, generation)
+        for entry in reversed(state.get("completed_results", [])):
+            result = entry.get("result") or {}
+            if (str(result.get("task_id")) == str(current_task["id"])
+                    and int(result.get("scoring_generation", -1)) == generation
+                    and int(result.get("interaction_count", -1)) == int(current_task.get("interaction_count") or 0)
+                    and int(result.get("score", -1)) == int(current_task.get("score") or 0)):
+                return {field: result.get(field) for field in (
+                    "task_id", "scoring_generation", "interaction_count",
+                    "completion_blocker", "reason", "practice_tip",
+                )}
+    except Exception as exc:
+        logger.warning("[BATCH_EVAL] feedback restoration unavailable: %s", type(exc).__name__)
+    return None
+
+
 async def _post_scoring_window(payload, token):
     """Call Workflow with bounded retries; pending/errors never become points."""
     attempts = len(_SCORING_RETRY_DELAYS) + 1
@@ -735,6 +758,9 @@ async def _post_scoring_window(payload, token):
                     )
                     if attempt < len(_SCORING_RETRY_DELAYS):
                         await asyncio.sleep(_SCORING_RETRY_DELAYS[attempt])
+                    else:
+                        return {**result, "evaluation_status": "readiness_pending",
+                                "completion_blocker": "readiness_unavailable"}
                     continue
                 logger.warning(
                     "[BATCH_EVAL] evaluation pending id=%s attempt=%s",
@@ -971,6 +997,8 @@ async def _emit_scoring_result(callback, current_task, task_id, turn_ids, result
             "task_score": score, "interaction_count": count,
             "message": reason, "reason": reason,
             "quality": result.get("quality"), "model_id": result.get("model_id"),
+            "completion_blocker": result.get("completion_blocker"),
+            "practice_tip": result.get("practice_tip", ""),
             "evaluation_status": "completed",
             "window_completed": True,
             "completed_window_count": int(result.get("completed_window_count", 0) or 0),
@@ -999,6 +1027,7 @@ async def _emit_scoring_result(callback, current_task, task_id, turn_ids, result
                 "scenario_title": current_task.get("scenario_title", ""),
                 "next_task": (next_task.get("task_description") or next_task.get("text")) if has_next_task else None,
                 "score": score, "interaction_count": count,
+                "scoring_generation": int(result.get("scoring_generation", 0) or 0),
                 "evaluation_id": result.get("evaluation_id"),
             },
         })
@@ -1021,6 +1050,9 @@ async def _emit_scoring_result(callback, current_task, task_id, turn_ids, result
         "task_title": result.get("task_title", current_task.get("task_description", "Task")),
         "scenario_title": result.get("scenario_title", current_task.get("scenario_title", "")),
         "message": reason, "evaluation_id": result.get("evaluation_id"),
+        "scoring_generation": int(result.get("scoring_generation", 0) or 0),
+        "completion_blocker": result.get("completion_blocker"),
+        "practice_tip": result.get("practice_tip", ""),
     }
 
 
@@ -1168,11 +1200,20 @@ async def _handle_turn_with_accumulator(
                 return completed_result
             active = state.setdefault("turns", [])
             queued = state.setdefault("queue", [])
-            if result is None:
+            if result is None or result.get("evaluation_status") == "readiness_pending":
                 state["evaluator_owner"] = None
                 state["evaluation_started_at"] = 0
                 state["frozen"] = True
                 await _save_scoring_window(redis, key, state, lock_key, finalize_owner)
+                await callback._safe_send({
+                    "type": "scoring_feedback",
+                    "payload": {
+                        "task_id": task_id, "scoring_generation": generation,
+                        "interaction_count": (result or {}).get("interaction_count"),
+                        "completion_blocker": (result or {}).get(
+                            "completion_blocker", "evaluation_unavailable"),
+                    },
+                })
                 break
             if result.get("evaluation_status") == "stale_generation":
                 # A user-initiated reset invalidates both the in-flight window
@@ -1329,6 +1370,8 @@ async def _evaluate_scene_turn_progress(
                 "score": result.get("task_score", 0),
                 "message": result.get("message", "You have mastered this task!"),
                 "ready_token": result.get("ready_token"),
+                "scoring_generation": result.get("scoring_generation", 0),
+                "interaction_count": result.get("interaction_count", 0),
             },
         })
     return result
@@ -3913,6 +3956,8 @@ class WebSocketCallback(OmniRealtimeCallback):
                                                     "score": task_score,
                                                     "message": workflow_result.get('message', 'You have mastered this task!'),
                                                     "ready_token": workflow_result.get('ready_token'),
+                                                    "scoring_generation": workflow_result.get('scoring_generation', 0),
+                                                    "interaction_count": workflow_result.get('interaction_count', 0),
                                                 }
                                             })
                                             logger.info(f"[TASK_READY] Task ready to complete: {task_title} (score={task_score})")
@@ -4436,14 +4481,19 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None), ses
     loop = asyncio.get_running_loop()
     
     callback = WebSocketCallback(websocket, loop, user_context, token, user_id, session_id, history_messages, scenario, mode)
-    if had_persisted_history:
+    if had_persisted_history or (current_task_id and mode not in ('recall', 'daily_qa', 'tour', 'magic_repetition')):
         callback.restored_state = {
             "session_id": session_id,
             "task_id": current_task_id,
             "score": int(current_task.get("score") or 0),
             "interaction_count": int(current_task.get("interaction_count") or 0),
+            "scoring_generation": int(current_task.get("scoring_generation") or 0),
             "restored_message_count": len(history_messages),
         }
+        if mode not in ('recall', 'daily_qa', 'tour', 'magic_repetition'):
+            callback.restored_state["progress_feedback"] = await _restore_progress_feedback(
+                _get_redis_client(), user_id, active_goal.get("id"), current_task,
+            )
     phase_key = callback.phase_key  # f"{user_id}:{scenario or ''}" — 每个场景独立
 
     # ── Daily Q&A mode bootstrap (Feature 2) ──
@@ -4914,6 +4964,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(None), ses
                             "type": "task_completed",
                             "payload": {
                                 "task_title": completed_task.get('task_description') or completed_task.get('text', 'Task'),
+                                "task_id": completed_task.get('id', confirm_task_id),
+                                "scoring_generation": completed_task.get('scoring_generation', 0),
                                 "scenario_title": callback.user_context.get('custom_topic', 'General Practice').split(" (Tasks:")[0].strip(),
                                 "score": completed_task.get('score', 9),
                                 "message": completed_task.get('feedback') or "Task completed!",

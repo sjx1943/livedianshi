@@ -41,4 +41,14 @@ export function isCompletedWindowEvaluation(payload = {}) {
   return payload.evaluation_status === 'completed' || payload.window_completed === true;
 }
 
+// Completion/feedback messages can arrive after a task switch or reset.
+export function isCurrentScoringMessage(payload, activeTask, generations, latestOrder = 0) {
+  if (!payload?.task_id || !activeTask?.id || String(payload.task_id) !== String(activeTask.id)) return false;
+  const expected = generations.get(String(payload.task_id)) ?? Number(activeTask.scoring_generation || 0);
+  if (Number(payload.scoring_generation ?? 0) !== expected) return false;
+  const baseline = expected === Number(activeTask.scoring_generation || 0)
+    ? Number(activeTask.interaction_count || 0) : 0;
+  return payload.interaction_count == null || Number(payload.interaction_count) >= Math.max(latestOrder, baseline);
+}
+
 export { COMPLETION_SCORE, MAX_PROGRESS_PER_TURN };
