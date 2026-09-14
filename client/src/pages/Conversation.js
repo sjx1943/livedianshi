@@ -25,7 +25,8 @@ import { resolveDailyLimitModal } from './dailyLimitLogic';
 import { shouldUseProgressiveAudio, progressiveAudioSrc, nextProgressiveAttempt } from './audioPlaybackLogic';
 import { cleanStreamingText, appendDelta, aiBubbleRenderState, stripAllMarkers, extractMagicSentence } from './streamingTextLogic';
 import { normalizeConnectionError, shouldShowConnectionError } from './connectionErrorLogic';
-import { calculateTaskProgress, isCompletedWindowEvaluation } from './conversationProgress';
+import { calculateTaskProgress, isCompletedWindowEvaluation, isCurrentScoringMessage } from './conversationProgress';
+import TaskProgressGuidance from '../components/TaskProgressGuidance';
 import { createPcmStreamScheduler, unpackPcmAudioPacket } from '../utils/pcmStreamScheduler';
 
 const MAGIC_TIPS = [
@@ -512,6 +513,17 @@ function Conversation() {
   const previousProgressRef = useRef(0); // Track previous progress to prevent unreasonable jumps
   const lastSeenTaskIdRef = useRef(null); // Track task ID to detect task switches
   const scoringGenerationByTaskRef = useRef(new Map()); // Reject late evaluations from before an explicit reset
+  const [progressFeedback, setProgressFeedback] = useState(null);
+  const [completionSheetDismissed, setCompletionSheetDismissed] = useState(false);
+  const feedbackOrderRef = useRef(new Map());
+  const activeScoringTask = tasks.find(task => typeof task === 'object'
+    && task.status !== 'completed' && !completedTasks.has(task.text));
+  const activeScoringTaskRef = useRef(null);
+  activeScoringTaskRef.current = activeScoringTask;
+  const acceptScoringMessage = useCallback(payload => isCurrentScoringMessage(
+    payload, activeScoringTaskRef.current, scoringGenerationByTaskRef.current,
+    feedbackOrderRef.current.get(`${payload?.task_id}:${payload?.scoring_generation ?? 0}`) || 0,
+  ), []);
 
   // Initialize showTasks based on whether we have scenario info
   // Tasks will be loaded from backend, so we show tasks if scenario is specified
@@ -1216,6 +1228,10 @@ function Conversation() {
     if (resetProgress) {
       setCurrentTaskProgress(0);
       setCurrentTaskScore(0);
+      setProgressFeedback(null);
+      setTaskReadyToComplete(null);
+      setTaskCompletionPending(false);
+      feedbackOrderRef.current.clear();
       // 重置魔法重复阶段状态
       setMagicPassedTasks(new Set());
       setCurrentMagicSentence('');
@@ -1326,7 +1342,7 @@ function Conversation() {
 
   // Handle task completion confirmation
   const handleConfirmComplete = () => {
-    if (!taskReadyToComplete || taskCompletionPending) return;
+    if (!taskReadyToComplete || !acceptScoringMessage(taskReadyToComplete) || taskCompletionPending) return;
     const wsReadyState = socketRef.current?.getReadyState?.() || socketRef.current?.readyState;
     if (wsReadyState === WebSocket.OPEN) {
       console.log('🏁 Sending user_confirmed_complete:', taskReadyToComplete.task_id);
@@ -1440,10 +1456,16 @@ function Conversation() {
              interactionCount: restoredCount,
              taskCompleted: Boolean(restored.task_completed),
            });
-           setCurrentTaskScore(restoredScore);
-           setCurrentTaskProgress(restoredProgress);
-           previousProgressRef.current = restoredProgress;
-           if (restored.task_id) lastSeenTaskIdRef.current = restored.task_id;
+           if (acceptScoringMessage(restored)) {
+             setTaskReadyToComplete(null);
+             setTaskCompletionPending(false);
+             feedbackOrderRef.current.set(`${restored.task_id}:${restored.scoring_generation ?? 0}`, restoredCount);
+             setCurrentTaskScore(restoredScore);
+             setCurrentTaskProgress(restoredProgress);
+             setProgressFeedback(restored.progress_feedback || null);
+             previousProgressRef.current = restoredProgress;
+             if (restored.task_id) lastSeenTaskIdRef.current = restored.task_id;
+           }
            isRestoringSessionRef.current = false;
            setIsRestoringSession(false);
            setIsConnected(true);
@@ -1932,6 +1954,7 @@ function Conversation() {
         case 'proficiency_update':
            // Handle proficiency update notification with deduplication
            const profPayload = data.payload || {};
+           if (!acceptScoringMessage(profPayload)) break;
            const expectedGeneration = scoringGenerationByTaskRef.current.get(String(profPayload.task_id));
            const payloadGeneration = Number(profPayload.scoring_generation);
            const staleGeneration = expectedGeneration !== undefined && (
@@ -1949,6 +1972,11 @@ function Conversation() {
                break;
            }
            lastProficiencyUpdateRef.current = updateKey;
+           feedbackOrderRef.current.set(`${profPayload.task_id}:${profPayload.scoring_generation ?? 0}`, Number(profPayload.interaction_count || 0));
+           setProgressFeedback(profPayload.task_completed ? null : {
+             ...profPayload,
+             reason: profPayload.reason || profPayload.message || '',
+           });
 
            // Detect task switch and reset progress tracking
            const newTaskId = profPayload.task_id;
@@ -2053,6 +2081,8 @@ function Conversation() {
            // Handle task completion notification
            console.log('✅ Task Completed:', data.payload);
            const taskPayload = data.payload || {};
+           if (taskPayload.task_id && !acceptScoringMessage(taskPayload)) break;
+           setProgressFeedback(null);
            setTaskCompletionPending(false);
            setTaskReadyToComplete(null);
            if (taskPayload.task_title) {
@@ -2273,9 +2303,20 @@ function Conversation() {
            setDailyQAIsBonus(!!data.payload?.is_bonus);
            setTimeout(() => setShowDailyQAPassModal(true), 800);
            break;
+        case 'scoring_feedback':
+           if (acceptScoringMessage(data.payload)) {
+               if (data.payload.interaction_count != null) feedbackOrderRef.current.set(`${data.payload.task_id}:${data.payload.scoring_generation ?? 0}`, Number(data.payload.interaction_count));
+               setProgressFeedback(data.payload);
+               setTaskReadyToComplete(null);
+               setTaskCompletionPending(false);
+           }
+           break;
         case 'task_ready_to_complete':
            console.log('🏁 Task Ready to Complete:', data.payload);
-           if (data.payload) {
+           if (acceptScoringMessage(data.payload)) {
+               if (data.payload.interaction_count != null) feedbackOrderRef.current.set(`${data.payload.task_id}:${data.payload.scoring_generation ?? 0}`, Number(data.payload.interaction_count));
+               setProgressFeedback(null);
+               setCompletionSheetDismissed(false);
                setTaskCompletionPending(false);
                setTaskReadyToComplete(data.payload);
            }
@@ -2344,7 +2385,7 @@ function Conversation() {
            // Ignore unknown message types silently
            break;
       }
-  }, [setCurrentTaskProgress, setCurrentTaskScore, setEngagementLevel, setCompletedTasks, setTasks, location.state, userAPI]);
+  }, [setCurrentTaskProgress, setCurrentTaskScore, setEngagementLevel, setCompletedTasks, setTasks, location.state, userAPI, acceptScoringMessage]);
 
   const playAudioChunk = useCallback(async (audioDataOrPromise) => {
     if (isInterruptedRef.current) return; // Drop audio if interrupted
@@ -3515,6 +3556,15 @@ function Conversation() {
       )}
 
       {/* Floating Playback Button */}
+      {!ccMode && !isTourMode && !isRecallMode && !isDailyQAMode && currentPhase === 'scene_theater'
+        && activeScoringTask && currentTaskScore >= 9 && currentTaskProgress < 100 && (
+        <TaskProgressGuidance
+          feedback={progressFeedback && acceptScoringMessage(progressFeedback) ? progressFeedback : null}
+          taskTitle={activeScoringTask.text}
+          ready={Boolean(taskReadyToComplete && acceptScoringMessage(taskReadyToComplete))}
+          onConfirm={() => setCompletionSheetDismissed(false)}
+        />
+      )}
       {selection.visible && (
         <button
           onClick={playSelectedText}
@@ -3736,7 +3786,7 @@ function Conversation() {
             aria-label="退出 CC 沉浸模式"
             className="min-h-11 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60"
             style={{
-            position: 'absolute', top: 10, right: 14,
+            position: 'absolute', top: 10, right: 14, zIndex: 1,
             background: 'var(--card)', border: '1px solid var(--border-solid)',
             borderRadius: 20, padding: '5px 12px', fontSize: 11, fontWeight: 600,
             color: 'var(--foreground-muted)', cursor: 'pointer', fontFamily: 'inherit',
@@ -3766,6 +3816,17 @@ function Conversation() {
                   transition: 'width 0.4s ease',
                 }} />
               </div>
+              {!isTourMode && currentPhase === 'scene_theater' && activeScoringTask
+                && currentTaskScore >= 9 && currentTaskProgress < 100 && (
+                <div className="w-full max-w-lg max-h-[25vh] overflow-y-auto px-4">
+                  <TaskProgressGuidance
+                    feedback={progressFeedback && acceptScoringMessage(progressFeedback) ? progressFeedback : null}
+                    taskTitle={activeScoringTask.text}
+                    ready={Boolean(taskReadyToComplete && acceptScoringMessage(taskReadyToComplete))}
+                    onConfirm={() => setCompletionSheetDismissed(false)}
+                  />
+                </div>
+              )}
             </div>
           )}
 
@@ -3997,7 +4058,7 @@ function Conversation() {
         )}
       </AnimatePresence>
       <AnimatePresence>
-        {taskReadyToComplete && (
+        {taskReadyToComplete && acceptScoringMessage(taskReadyToComplete) && !completionSheetDismissed && (
           <TaskCompletionSheet
             taskReadyToComplete={taskReadyToComplete}
             tasks={tasks}
@@ -4005,7 +4066,7 @@ function Conversation() {
             onConfirm={handleConfirmComplete}
             onContinue={() => {
               setTaskCompletionPending(false);
-              setTaskReadyToComplete(null);
+              setCompletionSheetDismissed(true);
             }}
             canConfirm={isConnected && !taskCompletionPending}
           />

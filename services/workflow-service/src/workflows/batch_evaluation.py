@@ -111,6 +111,7 @@ class BatchEvaluationWorkflow:
             task_id=resolved_task_id, evaluation_id=evaluation_id,
             scoring_generation=scoring_generation, turn_count=window_size,
             quality=quality, delta=delta, reason=assessment["reason"],
+            practice_tip=assessment.get("practice_tip", ""),
         )
         result.pop("_idempotent_replay", False)
         return self._reconcile_readiness(result, redis_client)
@@ -194,7 +195,11 @@ repetition, and incorrect answers must never be rewarded.
 
 Return strict JSON only:
 {{"quality":"<one value above>","evidence_sufficient":true|false,
-"reason":"<one short sentence in {native_language}>"}}
+"reason":"<one short sentence in {native_language}>",
+"practice_tip":"<one specific next practice action in {native_language}, with a short example in {target_language}>"}}
+The practice_tip must address this task and the student's observed difficulty.
+Explain what to say or improve next; do not merely say 'keep practicing'.
+Do not promise a score or completion, and do not invent errors unsupported by the window.
 Do not return a score or delta; the server owns score mapping."""
 
     @staticmethod
@@ -209,12 +214,16 @@ Do not return a score or delta; the server owns score mapping."""
         reason = str(parsed.get("reason") or "").strip()
         if not reason:
             raise ValueError("model returned no reason")
-        return {"quality": quality, "evidence_sufficient": parsed["evidence_sufficient"], "reason": reason[:240]}
+        tip = parsed.get("practice_tip", "")
+        # Older cached/model responses remain valid during rolling deployment.
+        tip = tip.strip()[:400] if isinstance(tip, str) else ""
+        return {"quality": quality, "evidence_sufficient": parsed["evidence_sufficient"],
+                "reason": reason[:240], "practice_tip": tip}
 
     async def _apply_evaluation(
         self, *, db_connection: Any, user_id: str, goal_id: int, task_id: int,
         evaluation_id: str, scoring_generation: int, turn_count: int,
-        quality: str, delta: int, reason: str,
+        quality: str, delta: int, reason: str, practice_tip: str = "",
     ) -> Dict[str, Any]:
         async with db_connection.transaction():
             task = await db_connection.fetchrow(
@@ -301,6 +310,7 @@ Do not return a score or delta; the server owns score mapping."""
                     "completed_window_count": completed_window_count,
                 }
 
+            result["practice_tip"] = practice_tip
             readiness_intent = {
                 "ready": bool(result.get("task_ready_to_complete", False)),
                 "scoring_generation": scoring_generation,
@@ -448,6 +458,18 @@ Do not return a score or delta; the server owns score mapping."""
         )
         reconciled["ready_token"] = token
         reconciled["task_ready_to_complete"] = bool(token) and bool(intent["ready"])
+        if reconciled.get("task_completed") or reconciled["task_ready_to_complete"]:
+            blocker = None
+        elif intent["ready"]:
+            blocker = "readiness_unavailable"
+        elif int(reconciled.get("score") or 0) < 9:
+            blocker = "score"
+        elif (int(reconciled.get("completed_window_count") or 0) < 3
+              or int(reconciled.get("interaction_count") or 0) < 9):
+            blocker = "windows"
+        else:
+            blocker = "quality"
+        reconciled["completion_blocker"] = blocker
         return reconciled
 
     @classmethod

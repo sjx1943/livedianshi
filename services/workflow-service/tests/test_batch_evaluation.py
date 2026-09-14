@@ -333,6 +333,53 @@ async def test_three_strong_windows_reach_nine_and_latest_is_ready():
 
 
 @pytest.mark.asyncio
+async def test_task_372_sequence_explains_99_then_next_satisfactory_window_is_ready():
+    workflow, db, redis = BatchEvaluationWorkflow(), FakeDB(), FakeRedis()
+    qualities = ["satisfactory", "needs_work", "needs_work", "satisfactory"] + ["needs_work"] * 5
+    for index, quality in enumerate(qualities):
+        result = await evaluate(workflow, db, quality, evaluation_id=f"incident-{index}", redis=redis)
+    assert (result["score"], result["interaction_count"], result["completed_window_count"]) == (9, 27, 9)
+    assert result["completion_blocker"] == "quality"
+    assert not result["task_ready_to_complete"]
+    assert result["ready_token"] is None
+    for quality in ("off_topic", "repetitive", "incorrect"):
+        result = await evaluate(workflow, db, quality, evaluation_id=quality, redis=redis)
+        assert result["delta"] == 0
+        assert result["completion_blocker"] == "quality"
+        assert not result["task_ready_to_complete"]
+    result = await evaluate(workflow, db, "satisfactory", evaluation_id="recovery", redis=redis)
+    assert result["task_ready_to_complete"] is True
+    assert result["task_completed"] is False  # Explicit user confirmation still required.
+    assert result["completion_blocker"] is None
+    assert redis.values[workflow._ready_key("u1", 42)].endswith(":" + result["ready_token"])
+
+
+@pytest.mark.asyncio
+async def test_readiness_outage_is_distinct_and_replay_recovers_without_scoring_again():
+    workflow, db, redis = BatchEvaluationWorkflow(), FakeDB(), FakeRedis()
+    for index in range(2):
+        await evaluate(workflow, db, evaluation_id=f"ready-{index}", redis=redis)
+    result = await evaluate(workflow, db, evaluation_id="ready-2", redis=None)
+    assert result["completion_blocker"] == "readiness_unavailable"
+    updates = db.task_updates
+    recovered = await evaluate(workflow, db, evaluation_id="ready-2", redis=redis)
+    assert recovered["task_ready_to_complete"] is True
+    assert recovered["completion_blocker"] is None
+    assert db.task_updates == updates
+
+
+def test_practice_tip_is_bounded_optional_and_prompt_requests_specific_example():
+    result = BatchEvaluationWorkflow._validate_llm_result({
+        "quality": "needs_work", "evidence_sufficient": True,
+        "reason": "Missing a detail", "practice_tip": "x" * 500,
+    })
+    assert len(result["practice_tip"]) == 400
+    prompt = BatchEvaluationWorkflow._build_prompt(window(), TASK, "Chinese", "English")
+    assert "one specific next practice action in Chinese" in prompt
+    assert "short example in English" in prompt
+
+
+@pytest.mark.asyncio
 async def test_zero_delta_closed_window_still_counts_actual_turns():
     db = FakeDB()
     result = await evaluate(BatchEvaluationWorkflow(), db, "off_topic", size=4)
